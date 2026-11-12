@@ -10,6 +10,11 @@
   链 G：同一项目两个独立首次公告（保持两条独立链）
   公告 H：可通过 /fail-toggle 控制详情页返回 500，验证失败保留上次结果
 
+目录：
+  /announcements              基础场景目录（17 条）
+  /announcements/long-chain   1100 条连续引用的长链目录（按新到旧排列）
+  /announcements/cycle        1100 条公告构成的引用环目录（按新到旧排列）
+
 控制接口：
   GET /fail-toggle?enabled=1|0   开关 H-001 详情页的 500 故障
   GET /fail-status               查询当前故障开关
@@ -17,9 +22,14 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# 长链与成环目录的规模：超过 Python 默认递归上限（1000），用于验证长引用链
+LONG_CHAIN_LEN = 1100
+CYCLE_LEN = 1100
 
 # 每条公告：编号、项目编号、类型、发布时间、截止时间、引用编号
 NOTICES: list[dict] = [
@@ -91,7 +101,64 @@ NOTICES: list[dict] = [
      "ref": ""},
 ]
 
-NOTICE_BY_NO = {n["no"]: n for n in NOTICES}
+
+def _build_long_chain() -> list[dict]:
+    """1100 条连续引用：L-0001（首次）<- L-0002 <- ... <- L-1100（最新）。
+
+    中间更正均未给出截止时间（应继承首次），最新一条给出更晚的截止时间。
+    目录按新到旧排列，因此列表页先出现 L-1100。
+    """
+    base = datetime(2026, 10, 1, 9, 0, 0)
+    items: list[dict] = []
+    for i in range(1, LONG_CHAIN_LEN + 1):
+        if i == 1:
+            deadline = "2026-12-01 09:30:00"
+        elif i == LONG_CHAIN_LEN:
+            deadline = "2027-01-15 15:00:00"
+        else:
+            deadline = ""
+        items.append({
+            "no": f"L-{i:04d}",
+            "project": "PRJ-LONG",
+            "type": "首次公告" if i == 1 else "更正公告",
+            "publish": (base + timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S"),
+            "deadline": deadline,
+            "ref": "" if i == 1 else f"L-{i - 1:04d}",
+        })
+    return list(reversed(items))  # 目录按新到旧
+
+
+def _build_cycle() -> list[dict]:
+    """1100 条公告构成一个完整引用环：CY-xxxx -> 上一条 -> ... -> CY-1100。"""
+    base = datetime(2026, 10, 1, 9, 0, 0)
+    items: list[dict] = []
+    for i in range(1, CYCLE_LEN + 1):
+        items.append({
+            "no": f"CY-{i:04d}",
+            "project": "PRJ-CYCLE",
+            "type": "更正公告",
+            "publish": (base + timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S"),
+            "deadline": "2026-12-01 09:30:00",
+            "ref": f"CY-{(i - 2) % CYCLE_LEN + 1:04d}",
+        })
+    return list(reversed(items))  # 目录按新到旧
+
+
+LONG_CHAIN_NOTICES = _build_long_chain()
+CYCLE_NOTICES = _build_cycle()
+
+# 目录标识 -> 公告列表
+CATALOGS: dict[str, list[dict]] = {
+    "announcements": NOTICES,
+    "long-chain": LONG_CHAIN_NOTICES,
+    "cycle": CYCLE_NOTICES,
+}
+
+NOTICE_BY_NO = {
+    n["no"]: n
+    for items in CATALOGS.values()
+    for n in items
+}
 
 # 运行期故障开关（内存态，重启容器即恢复）
 FAIL_ENABLED = {"H-001": False}
@@ -107,21 +174,35 @@ a { color: #1a56c4; }
 """
 
 
-def render_list() -> str:
+CATALOG_TITLES = {
+    "announcements": "公共采购公告列表（示例站）",
+    "long-chain": "长引用链目录（1100 条连续引用 · 按新到旧）",
+    "cycle": "引用成环目录（1100 条公告构成环 · 按新到旧）",
+}
+
+
+def render_list(catalog: str = "announcements") -> str:
+    notices = CATALOGS[catalog]
+    nav = " · ".join(
+        f'<a href="/announcements/{key}">{escape(CATALOG_TITLES[key])}</a>'
+        if key != catalog else escape(CATALOG_TITLES[key])
+        for key in CATALOGS
+    )
     rows = "\n".join(
         '<tr><td><a href="/notice/{no}">{no}</a></td>'
         '<td>{project}</td><td>{type}</td><td>{publish}</td></tr>'.format(
             no=escape(n["no"]), project=escape(n["project"]),
             type=escape(n["type"]), publish=escape(n["publish"]),
         )
-        for n in NOTICES
+        for n in notices
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>公共采购公告列表</title><style>{PAGE_CSS}</style></head>
+<title>{escape(CATALOG_TITLES[catalog])}</title><style>{PAGE_CSS}</style></head>
 <body>
-<h1>公共采购公告列表（示例站）</h1>
-<p class="meta">共 {len(NOTICES)} 条公告 · 仅用于演示采集 API</p>
+<h1>{escape(CATALOG_TITLES[catalog])}</h1>
+<p class="meta">共 {len(notices)} 条公告 · 仅用于演示采集 API</p>
+<p class="meta">{nav}</p>
 <table class="announcement-list">
 <thead><tr><th>公告编号</th><th>项目编号</th><th>类型</th><th>发布时间</th></tr></thead>
 <tbody>{rows}</tbody>
@@ -172,8 +253,14 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path in ("/", "/announcements"):
-            self._send(render_list())
+            self._send(render_list("announcements"))
             return
+
+        if path.startswith("/announcements/"):
+            catalog = path.rsplit("/", 1)[-1]
+            if catalog in CATALOGS:
+                self._send(render_list(catalog))
+                return
 
         if path == "/fail-toggle":
             enabled = (query.get("enabled", ["0"])[0] in {"1", "true", "yes"})

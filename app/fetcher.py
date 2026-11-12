@@ -1,5 +1,6 @@
 """HTTP 抓取层：带超时与有限重试。"""
 import logging
+import threading
 import time
 
 import httpx
@@ -8,9 +9,25 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
+_client: httpx.Client | None = None
+_client_lock = threading.Lock()
+
 
 class FetchError(Exception):
     """页面抓取失败（网络错误或非 2xx 响应）。"""
+
+
+def _shared_client() -> httpx.Client:
+    """复用连接池的共享客户端。
+
+    一次同步会连续抓取成百上千条详情页；每条都新建 TCP 连接会显著拖慢长
+    引用链的采集，因此复用同一个 Client（httpx.Client 可跨线程共享）。
+    """
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = httpx.Client(follow_redirects=True)
+        return _client
 
 
 def fetch(url: str) -> str:
@@ -18,7 +35,7 @@ def fetch(url: str) -> str:
     last_error: Exception | None = None
     for attempt in range(config.FETCH_RETRIES + 1):
         try:
-            resp = httpx.get(url, timeout=config.FETCH_TIMEOUT, follow_redirects=True)
+            resp = _shared_client().get(url, timeout=config.FETCH_TIMEOUT)
             if resp.status_code >= 500:
                 raise FetchError(f"服务端错误 HTTP {resp.status_code}")
             if resp.status_code != 200:

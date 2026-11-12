@@ -36,8 +36,13 @@ ENTRY_AFTER_REVOCATION = "entry_after_revocation"
 UNREACHABLE = "unreachable"
 
 
-def recompute(conn: sqlite3.Connection) -> None:
-    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。"""
+def recompute(conn: sqlite3.Connection, *, commit: bool = True) -> None:
+    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。
+
+    Args:
+        commit: 是否在计算完成后提交事务。同步服务会传 ``False``，把本轮详情
+            写入与链重算放进同一个事务，保证二者作为完整结果一并保存。
+    """
     rows = conn.execute(
         "SELECT * FROM announcements ORDER BY id"
     ).fetchall()
@@ -159,38 +164,42 @@ def recompute(conn: sqlite3.Connection) -> None:
             "conflict_reasons = ?, effective_deadline = NULL WHERE notice_no = ?",
             (json.dumps(per_notice, ensure_ascii=False) if per_notice else None, no),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _mark_cycles(
     notices: dict[str, dict], conflicts: dict[str, set[str]]
 ) -> None:
-    """检测引用环，环上每个公告都标记 reference_cycle。"""
+    """检测引用环，环上每个公告都标记 reference_cycle。
+
+    使用迭代式 DFS（而非递归）沿 ref 反向追溯：真实公告目录可能存在上千条
+    连续引用，递归深度会超过 Python 默认递归上限而报 RecursionError。
+    """
     state: dict[str, int] = {}  # 0=访问中 1=已完成
-    stack: list[str] = []
-    in_stack: set[str] = set()
-
-    def visit(no: str) -> None:
-        state[no] = 0
-        stack.append(no)
-        in_stack.add(no)
-        ref = notices[no]["ref_notice_no"]
-        if ref and ref in notices:
-            mark = state.get(ref)
-            if mark == 0:
-                # 发现环：从环入口到栈顶全部标记
-                idx = stack.index(ref)
-                for cyclic in stack[idx:]:
-                    conflicts[cyclic].add(REFERENCE_CYCLE)
-            elif mark is None:
-                visit(ref)
-        stack.pop()
-        in_stack.discard(no)
-        state[no] = 1
-
-    for no in notices:
-        if state.get(no) is None:
-            visit(no)
+    for start in notices:
+        if start in state:
+            continue
+        # 显式栈保存 (节点, 该节点的引用目标) 路径，便于回溯
+        stack: list[str] = [start]
+        while stack:
+            no = stack[-1]
+            if no not in state:
+                state[no] = 0
+                ref = notices[no]["ref_notice_no"]
+                if ref and ref in notices:
+                    mark = state.get(ref)
+                    if mark == 0:
+                        # 发现环：从环入口到当前栈顶全部标记
+                        idx = stack.index(ref)
+                        for cyclic in stack[idx:]:
+                            conflicts[cyclic].add(REFERENCE_CYCLE)
+                    elif mark is None:
+                        stack.append(ref)
+                        continue
+            # 当前节点处理完毕（无未访问的引用或在环处截断）
+            stack.pop()
+            state[no] = 1
 
 
 def _effective_deadline(

@@ -24,7 +24,7 @@
 ├── sample_site/            # 示例公告站（仅 Python 标准库）
 │   ├── server.py
 │   └── Dockerfile
-├── tests/                  # pytest 测试（19 个用例）
+├── tests/                  # pytest 测试（25 个用例）
 ├── Dockerfile              # API 镜像
 ├── docker-compose.yml      # api + sample-site 两个服务
 └── requirements.txt
@@ -38,6 +38,7 @@ docker compose up --build
 
 - 采集 API：http://localhost:8000 （交互式文档 /docs）
 - 示例公告站：http://localhost:8080/announcements
+  （长链目录 `/announcements/long-chain`、成环目录 `/announcements/cycle`）
 
 触发一次同步：
 
@@ -50,6 +51,22 @@ curl -X POST http://localhost:8000/api/v1/sync \
 查询引用链与孤立异常公告：
 
 ```bash
+curl http://localhost:8000/api/v1/chains
+```
+
+示例站还内置两个用于演示长引用链的目录（均按新到旧排列）：
+
+```bash
+# 1100 条连续引用：同步后得到 1 条 ok 长链与有效截止时间
+curl -X POST http://localhost:8000/api/v1/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"list_url": "http://sample-site:8080/announcements/long-chain"}'
+curl http://localhost:8000/api/v1/chains
+
+# 1100 条公告构成引用环：全部按既有规则显示 reference_cycle 冲突原因
+curl -X POST http://localhost:8000/api/v1/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"list_url": "http://sample-site:8080/announcements/cycle"}'
 curl http://localhost:8000/api/v1/chains
 ```
 
@@ -81,6 +98,14 @@ pytest -q
 | GET | `/api/v1/chains` | 返回全部引用链 `chains` 与孤立异常公告 `orphans` |
 | GET | `/api/v1/announcements/{notice_no}` | 查询单条公告（含抓取错误、链状态） |
 | GET | `/api/v1/sync-runs?limit=20` | 同步执行记录 |
+
+同步响应中的 `status`：
+
+| 状态 | 含义 |
+| --- | --- |
+| `success` | 全部详情抓取成功，链归并完成并已提交 |
+| `partial` | 部分详情抓取失败（失败项沿用上次结果），链归并完成并已提交 |
+| `failed` | 列表页抓取失败，或链归并失败（本轮详情已回滚，保留上次链结果） |
 
 `/api/v1/chains` 响应示例（节选）：
 
@@ -127,6 +152,8 @@ pytest -q
 - 更正/撤销通过「引用编号」指向上一条公告；沿引用反向追溯，链标识取链上
   首次公告的公告编号。
 - **同一项目编号下的不同首次公告保持独立**，不做合并（示例中 PRJ-G 有两条链）。
+- 引用追溯使用迭代式遍历，**不设深度上限**：上千条连续引用（如按新到旧排列的
+  1100 条目录）也能完整归并为一条链并返回有效截止时间，不会因递归过深报错。
 - 链状态：
   - `ok`：结构正常，返回有效截止时间；
   - `cancelled`：链上存在撤销公告，整条链失效，有效截止时间为 `null`；
@@ -157,6 +184,18 @@ pytest -q
   - 从未成功 → 写入占位记录并归入孤立异常，避免静默丢失。
 - 每次同步后基于库内现有数据全量重算链状态。
 
+### 一轮同步的完整性（详情 + 链结果）
+
+- 本轮全部详情写入与引用链重算放在**同一个事务**中，作为完整结果一并提交。
+- 链归并失败（例如数据异常或代码故障）时：
+  - 回滚本轮全部详情改动，库内保留上一次成功的详情与链结果；
+  - 本次同步执行记录标记为 `failed`，`message` 写明归并失败，**不会停在 `running`**；
+  - 故障排除后重新同步即可恢复，正常写入新数据。
+- 抓取阶段先把本轮详情全部抓完再进入短事务，长引用链采集期间不长时间占用
+  数据库写锁。
+- 抓取客户端复用连接池，同步上千条详情页时不必为每条公告重建 TCP 连接。
+- 单条详情抓取失败仍沿用旧记录（见上一节），不影响同轮其它公告落库。
+
 ## 示例公告站内置场景
 
 | 编号 | 场景 | 预期结果 |
@@ -169,6 +208,21 @@ pytest -q
 | F-001 | 更正公告无引用编号 | 孤立，missing_reference |
 | G-001 / G-101（+G-102） | 同项目两个独立首次公告 | 两条独立链 |
 | H-001 | 可切换 500 故障 | 验证失败保留上次结果 |
+
+长引用链目录（`/announcements/long-chain`、`/announcements/cycle`）：
+
+| 目录 | 规模与排列 | 预期结果 |
+| --- | --- | --- |
+| `/announcements/long-chain` | L-0001~L-1100 连续引用，按新到旧 | 1 条 `ok` 长链，有效截止时间为最新一条给出的 `2027-01-15 15:00:00` |
+| `/announcements/cycle` | CY-0001~CY-1100 构成引用环，按新到旧 | 1100 条全部孤立，均带 `reference_cycle`，有效截止为 null |
+
+目录入口（也可直接浏览页面）：
+
+```bash
+curl http://localhost:8080/announcements
+curl http://localhost:8080/announcements/long-chain
+curl http://localhost:8080/announcements/cycle
+```
 
 故障开关（仅示例站）：
 

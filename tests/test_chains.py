@@ -92,3 +92,46 @@ def test_missing_reference_marks_chain_conflict(tmp_path, monkeypatch):
     assert "missing_reference" in rows["M-2"]["conflict_reasons"]
     assert rows["M-1"]["chain_status"] == "ok"
     assert rows["M-1"]["effective_deadline"] == "2026-11-20 09:30:00"
+
+
+def test_long_reference_chain_beyond_recursion_limit(tmp_path, monkeypatch):
+    """1100 条连续引用不触发 RecursionError，正常归并为一条长链。"""
+    conn = _conn(tmp_path, monkeypatch)
+    length = 1100
+    for i in range(1, length + 1):
+        _insert(
+            conn, f"L-{i:04d}",
+            chains.FIRST if i == 1 else chains.CORRECTION,
+            ref=None if i == 1 else f"L-{i - 1:04d}",
+            deadline="2027-01-15 15:00:00" if i == length else "",
+        )
+
+    chains.recompute(conn)
+    rows = _map(conn)
+
+    assert rows["L-0001"]["chain_id"] == "L-0001"
+    assert rows["L-0001"]["chain_status"] == "ok"
+    # 最新一条给出的截止时间被采纳，链上全部公告归入同一链
+    assert rows["L-0001"]["effective_deadline"] == "2027-01-15 15:00:00"
+    assert all(r["chain_id"] == "L-0001" for r in rows.values())
+    # 链成员按引用关系完整收录，没有遗漏成孤立
+    assert len(rows) == length
+
+
+def test_long_reference_cycle_keeps_conflict_reason(tmp_path, monkeypatch):
+    """1100 条公告构成的引用环全部按既有规则成为 reference_cycle 孤立。"""
+    conn = _conn(tmp_path, monkeypatch)
+    length = 1100
+    for i in range(1, length + 1):
+        _insert(conn, f"CY-{i:04d}", chains.CORRECTION,
+                ref=f"CY-{(i - 2) % length + 1:04d}",
+                deadline="2026-12-01 09:30:00")
+
+    chains.recompute(conn)
+    rows = _map(conn)
+
+    for row in rows.values():
+        assert row["chain_id"] is None
+        assert row["chain_status"] == "orphan"
+        assert "reference_cycle" in row["conflict_reasons"]
+        assert row["effective_deadline"] is None
